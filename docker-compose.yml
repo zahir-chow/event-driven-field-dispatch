@@ -209,6 +209,21 @@ services:
     command: python -m app.kafka_consumer
     restart: unless-stopped
 
+  # ─── Frontend Web Dashboard (React + Vite + Tailwind) ────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: dizpatch-frontend
+    ports:
+      - "5173:5173"
+    depends_on:
+      - work-order-service
+      - provider-service
+      - assignment-service
+      - notification-service
+    restart: unless-stopped
+
 # ─── Volumes ────────────────────────────────────────────────────────────────
 volumes:
   postgres_data:

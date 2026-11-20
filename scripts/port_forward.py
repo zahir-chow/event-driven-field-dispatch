@@ -15,7 +15,7 @@ import os
 import subprocess
 import sys
 
-PORTS = [8080, 8001, 8002, 8003, 8004, 5432, 9092, 29092]
+PORTS = [8080, 8001, 8002, 8003, 8004, 5432, 9092, 29092, 5173]
 
 
 def get_wsl_ip() -> str:

@@ -1,6 +1,7 @@
 import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from app.database import engine, Base
 from app.router import router as assignment_router
 from shared.middleware import configure_json_logging, add_correlation_middleware
@@ -27,6 +28,14 @@ app = FastAPI(
     description="Provider matching (Strategy Pattern), optimistic locking concurrency control, and Kafka event publishing",
     version="1.0.0",
     lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 add_correlation_middleware(app, service_name=SERVICE_NAME)
