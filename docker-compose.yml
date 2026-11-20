@@ -1,0 +1,215 @@
+services:
+  # ─── PostgreSQL 16 (Database-per-Service Architecture) ──────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: dizpatch-postgres
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-dizpatch}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dizpatch_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-dizpatch_work_orders}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-postgres-dbs.sql:/docker-entrypoint-initdb.d/init-dbs.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-dizpatch} -d ${POSTGRES_DB:-dizpatch_work_orders}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  # ─── Apache Kafka (KRaft mode, no Zookeeper) ─────────────────────────────────
+  kafka:
+    image: apache/kafka:3.7.0
+    container_name: dizpatch-kafka
+    ports:
+      - "${KAFKA_HOST_PORT:-9092}:9092"
+      - "${KAFKA_EXTERNAL_PORT:-29092}:29092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,PLAINTEXT_HOST://:29092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list > /dev/null 2>&1 || kafka-topics.sh --bootstrap-server localhost:9092 --list > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  # ─── Kafka UI ──────────────────────────────────────────────────────────────
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: dizpatch-kafka-ui
+    ports:
+      - "${KAFKA_UI_PORT:-8080}:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ─── Work Order Service (Port 8001) ─────────────────────────────────────────
+  work-order-service:
+    build:
+      context: .
+      dockerfile: services/work-order-service/Dockerfile
+    container_name: dizpatch-work-order-service
+    ports:
+      - "${WORK_ORDER_SERVICE_PORT:-8001}:8001"
+    environment:
+      DATABASE_URL: ${WORK_ORDER_DATABASE_URL:-postgresql+psycopg2://dizpatch:dizpatch_pass@postgres:5432/dizpatch_work_orders}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      SERVICE_NAME: work-order-service
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8001
+    restart: unless-stopped
+
+  work-order-outbox-relay:
+    build:
+      context: .
+      dockerfile: services/work-order-service/Dockerfile
+    container_name: dizpatch-work-order-outbox-relay
+    environment:
+      DATABASE_URL: ${WORK_ORDER_DATABASE_URL:-postgresql+psycopg2://dizpatch:dizpatch_pass@postgres:5432/dizpatch_work_orders}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      SERVICE_NAME: work-order-service
+    depends_on:
+      - work-order-service
+    command: python -m app.outbox_relay
+    restart: unless-stopped
+
+  # ─── Provider Service (Port 8002) ───────────────────────────────────────────
+  provider-service:
+    build:
+      context: .
+      dockerfile: services/provider-service/Dockerfile
+    container_name: dizpatch-provider-service
+    ports:
+      - "${PROVIDER_SERVICE_PORT:-8002}:8002"
+    environment:
+      DATABASE_URL: ${PROVIDER_DATABASE_URL:-postgresql+psycopg2://dizpatch:dizpatch_pass@postgres:5432/dizpatch_providers}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      SERVICE_NAME: provider-service
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8002
+    restart: unless-stopped
+
+  # ─── Assignment Service (Port 8003) ─────────────────────────────────────────
+  assignment-service:
+    build:
+      context: .
+      dockerfile: services/assignment-service/Dockerfile
+    container_name: dizpatch-assignment-service
+    ports:
+      - "${ASSIGNMENT_SERVICE_PORT:-8003}:8003"
+    environment:
+      DATABASE_URL: ${ASSIGNMENT_DATABASE_URL:-postgresql+psycopg2://dizpatch:dizpatch_pass@postgres:5432/dizpatch_assignments}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      PROVIDER_SERVICE_URL: ${PROVIDER_SERVICE_URL:-http://provider-service:8002}
+      WORK_ORDER_SERVICE_URL: ${WORK_ORDER_SERVICE_URL:-http://work-order-service:8001}
+      SERVICE_NAME: assignment-service
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      work-order-service:
+        condition: service_started
+      provider-service:
+        condition: service_started
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8003
+    restart: unless-stopped
+
+  assignment-outbox-relay:
+    build:
+      context: .
+      dockerfile: services/assignment-service/Dockerfile
+    container_name: dizpatch-assignment-outbox-relay
+    environment:
+      DATABASE_URL: ${ASSIGNMENT_DATABASE_URL:-postgresql+psycopg2://dizpatch:dizpatch_pass@postgres:5432/dizpatch_assignments}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      PROVIDER_SERVICE_URL: ${PROVIDER_SERVICE_URL:-http://provider-service:8002}
+      WORK_ORDER_SERVICE_URL: ${WORK_ORDER_SERVICE_URL:-http://work-order-service:8001}
+      SERVICE_NAME: assignment-service
+    depends_on:
+      - assignment-service
+    command: python -m app.outbox_relay
+    restart: unless-stopped
+
+  assignment-consumer:
+    build:
+      context: .
+      dockerfile: services/assignment-service/Dockerfile
+    container_name: dizpatch-assignment-consumer
+    environment:
+      DATABASE_URL: ${ASSIGNMENT_DATABASE_URL:-postgresql+psycopg2://dizpatch:dizpatch_pass@postgres:5432/dizpatch_assignments}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      PROVIDER_SERVICE_URL: ${PROVIDER_SERVICE_URL:-http://provider-service:8002}
+      WORK_ORDER_SERVICE_URL: ${WORK_ORDER_SERVICE_URL:-http://work-order-service:8001}
+      SERVICE_NAME: assignment-service
+    depends_on:
+      - assignment-service
+    command: python -m app.kafka_consumer
+    restart: unless-stopped
+
+  # ─── Notification Service (Port 8004) ───────────────────────────────────────
+  notification-service:
+    build:
+      context: .
+      dockerfile: services/notification-service/Dockerfile
+    container_name: dizpatch-notification-service
+    ports:
+      - "${NOTIFICATION_SERVICE_PORT:-8004}:8004"
+    environment:
+      DATABASE_URL: ${NOTIFICATION_DATABASE_URL:-postgresql+psycopg2://dizpatch:dizpatch_pass@postgres:5432/dizpatch_notifications}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      SERVICE_NAME: notification-service
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8004
+    restart: unless-stopped
+
+  notification-consumer:
+    build:
+      context: .
+      dockerfile: services/notification-service/Dockerfile
+    container_name: dizpatch-notification-consumer
+    environment:
+      DATABASE_URL: ${NOTIFICATION_DATABASE_URL:-postgresql+psycopg2://dizpatch:dizpatch_pass@postgres:5432/dizpatch_notifications}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      SERVICE_NAME: notification-service
+    depends_on:
+      - notification-service
+    command: python -m app.kafka_consumer
+    restart: unless-stopped
+
+# ─── Volumes ────────────────────────────────────────────────────────────────
+volumes:
+  postgres_data:
+  kafka_data:
